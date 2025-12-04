@@ -1,0 +1,623 @@
+#!/bin/zsh
+
+set -e
+setopt INTERACTIVE_COMMENTS
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# Global flags
+DRY_RUN=false
+
+print_step() { echo -e "${GREEN}[STEP]${NC} $1" >&2; }
+print_info() { echo -e "${YELLOW}[INFO]${NC} $1" >&2; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+print_dry_run() { echo -e "${YELLOW}[DRY RUN]${NC} $1" >&2; }
+
+die() { print_error "$1"; exit 1; }
+
+# --- Environment checks ---
+ensure_git_repo() { git rev-parse --git-dir >/dev/null 2>&1 || die "Not in a git repository"; }
+ensure_gh() { command -v gh >/dev/null 2>&1 || die "GitHub CLI (gh) is not installed"; }
+ensure_gh_auth() { gh auth status >/dev/null 2>&1 || die "GitHub CLI is not authenticated. Run 'gh auth login'"; }
+
+ensure_repo_context() {
+	# Prefer $GH_REPO, fallback to git remote, then gh default
+    if [ -z "${GH_REPO:-}" ]; then
+        local origin_url=$(git config --get remote.origin.url 2>/dev/null || echo "")
+        if [ -n "$origin_url" ]; then
+            local repo_path=$(echo "$origin_url" | sed -nE 's#.*github\.com[:/]([^/]+)/([^./]+).*#\1/\2#p')
+            [ -n "$repo_path" ] && export GH_REPO="$repo_path"
+        fi
+    fi
+	if [ -z "${GH_REPO:-}" ]; then
+		local def=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null || echo "")
+		[ -n "$def" ] && export GH_REPO="$def"
+	fi
+	[ -z "${GH_REPO:-}" ] && die "Could not determine GitHub repository. Set GH_REPO=<owner>/<repo> or add a git remote.";
+}
+
+# --- Utilities ---
+slugify_title() {
+	# lower, non-alnum -> -, collapse dashes, trim
+	local t="$1"
+	echo "$t" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/-\+/-/g; s/^-\|-$//g'
+}
+
+branch_name_for_issue() {
+	local issue_number="$1"; local issue_title="$2"
+	local slug=$(slugify_title "$issue_title")
+	# Industry-standard: issue/<number>-<slug>
+	echo "issue/$issue_number-$slug"
+}
+
+create_commit_if_needed() {
+	local title="$1"
+	if git diff --cached --quiet && git diff --quiet; then
+		print_info "No changes to commit; creating empty commit as fallback"
+		[ "$DRY_RUN" = true ] && { print_dry_run "Would create empty commit: 'feat: $title'"; return 0; }
+		git commit --allow-empty -m "feat: $title" >/dev/null
+	else
+		print_info "Staging and committing changes"
+		[ "$DRY_RUN" = true ] && { print_dry_run "Would add -A and commit: 'feat: $title'"; return 0; }
+		git add -A
+		git commit -m "feat: $title" >/dev/null
+	fi
+}
+
+push_set_upstream() {
+	local branch="$1"
+	[ "$DRY_RUN" = true ] && { print_dry_run "Would push -u origin $branch"; return 0; }
+	git push -u origin "$branch"
+}
+
+get_slack_token() {
+	if [ -n "${SLACK_BOT_TOKEN:-}" ]; then
+		echo "$SLACK_BOT_TOKEN"; return 0
+	elif [ -f "$HOME/.secrets/slack_token" ]; then
+		print_info "Using Slack token from ~/.secrets/slack_token"
+		tr -d '\n' < "$HOME/.secrets/slack_token"; return 0
+	fi
+	die "Slack token not found. Set SLACK_BOT_TOKEN or ~/.secrets/slack_token"
+}
+
+send_slack_cr_request() {
+	local message="$1"
+	local token=$(get_slack_token)
+	[ "$DRY_RUN" = true ] && { print_dry_run "Would send Slack message to #pr-cr-request: $message"; return 0; }
+	local resp=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+		-H "Content-Type: application/json" \
+		-H "Authorization: Bearer $token" \
+		-d "{\"channel\": \"#pr-cr-request\", \"text\": \"$message\"}")
+	if ! echo "$resp" | jq -e '.ok' >/dev/null 2>&1; then
+		print_error "Failed to send Slack message"; print_info "Response: $resp"; exit 1
+	fi
+}
+
+# --- Project helpers (gh-only) ---
+resolve_project_ids() {
+	# echo project_id|project_number or empty
+	local owner="${GH_REPO%%/*}"
+	local project_name="$1"
+	local info=$(gh project list --owner "$owner" --format json --jq ".projects[] | select(.title == \"$project_name\") | {id: .id, number: .number}" 2>/dev/null || echo "")
+	[ -n "$info" ] && [ "$info" != "null" ] || { echo "|"; return; }
+	local pid=$(echo "$info" | jq -r '.id')
+	local pnum=$(echo "$info" | jq -r '.number')
+	echo "$pid|$pnum"
+}
+
+project_status_apply() {
+	# args: issue_number project_name status_string [iteration_number]
+	local issue_number="$1"; local project_name="$2"; local status="$3"; local iteration="$4"
+	[ -z "$project_name" ] && return 0
+	local owner="${GH_REPO%%/*}"
+	local repo_name="${GH_REPO#*/}"
+	local ids=$(resolve_project_ids "$project_name")
+	local project_id="${ids%%|*}"; local project_number="${ids#*|}"
+	[ -z "$project_id" ] || [ -z "$project_number" ] && { print_info "Warning: Project '$project_name' not found"; return 0; }
+
+	local fields_json=$(gh project field-list "$project_number" --owner "$owner" --format json 2>/dev/null || echo "")
+	[ -z "$fields_json" ] && return 0
+	local status_field_id=$(echo "$fields_json" | jq -r '.fields[] | select(.name=="Status") | .id' | head -n1)
+	[ -z "$status_field_id" ] && { print_info "Warning: Project Status field missing"; status_field_id=""; }
+
+	local issue_url="https://github.com/$owner/$repo_name/issues/$issue_number"
+	local item_id=""
+	if [ "$DRY_RUN" = true ]; then
+		item_id="dry-item-id"
+		print_dry_run "Would add issue #$issue_number to project '$project_name'"
+	else
+		item_id=$(gh project item-add "$project_number" --owner "$owner" --url "$issue_url" --format json --jq '.id' 2>/dev/null || echo "")
+	fi
+	[ -z "$item_id" ] && { print_info "Warning: Could not add issue to project"; return 0; }
+
+	if [ -n "$status_field_id" ] && [ -n "$status" ]; then
+		local todo_id=$(echo "$fields_json" | jq -r '.fields[] | select(.name=="Status") | .options[] | select(.name=="Todo") | .id' | head -n1)
+		local ip_id=$(echo "$fields_json" | jq -r '.fields[] | select(.name=="Status") | .options[] | select(.name=="In Progress") | .id' | head -n1)
+		local done_id=$(echo "$fields_json" | jq -r '.fields[] | select(.name=="Status") | .options[] | select(.name=="Done") | .id' | head -n1)
+		local opt=""
+		case "$status" in
+			in-progress|"in progress"|progress) opt="$ip_id" ;;
+			todo) opt="$todo_id" ;;
+			done|complete|completed) opt="$done_id" ;;
+		esac
+		if [ -n "$opt" ]; then
+			if [ "$DRY_RUN" = true ]; then
+				print_dry_run "Would set Status to '$status'"
+			else
+				gh project item-edit --id "$item_id" --field-id "$status_field_id" --project-id "$project_id" --single-select-option-id "$opt" >/dev/null 2>&1 || true
+			fi
+		fi
+	fi
+
+	if [ -n "$iteration" ]; then
+		local iter_field_id=$(echo "$fields_json" | jq -r '.fields[] | select(.dataType=="ITERATION") | .id' | head -n1)
+		if [ -n "$iter_field_id" ]; then
+			local iter_value_id=$(echo "$fields_json" | jq -r --arg fid "$iter_field_id" --arg num "$iteration" '.fields[] | select(.id==$fid) | .configuration.iterations[] | select((.title|tostring|test("(^|[^0-9])"+$num+"([^0-9]|$)"))) | .id' | head -n1)
+			if [ -z "$iter_value_id" ] && [[ "$iteration" =~ ^[0-9]+$ ]] && [ "$iteration" -gt 0 ]; then
+				local idx=$((iteration - 1))
+				iter_value_id=$(echo "$fields_json" | jq -r --arg fid "$iter_field_id" --argjson idx $idx '.fields[] | select(.id==$fid) | .configuration.iterations[$idx].id // empty')
+			fi
+			if [ -n "$iter_value_id" ]; then
+				if [ "$DRY_RUN" = true ]; then
+					print_dry_run "Would set Iteration to identifier $iter_value_id"
+				else
+					gh project item-edit --id "$item_id" --field-id "$iter_field_id" --project-id "$project_id" --iteration-id "$iter_value_id" >/dev/null 2>&1 || true
+				fi
+			fi
+		fi
+	fi
+}
+
+# --- Metadata application ---
+apply_issue_metadata() {
+	# args: issue_number assignees_csv labels_csv milestone
+	local issue_number="$1"; local assignees="$2"; local labels="$3"; local milestone="$4"
+	[ -n "$assignees" ] && {
+		local IFS=','; for a in $assignees; do
+			[ "$DRY_RUN" = true ] && print_dry_run "Would add assignee $a to issue #$issue_number" || gh issue edit "$issue_number" --add-assignee "$a" >/dev/null 2>&1 || true
+		done
+	}
+	[ -n "$labels" ] && {
+		local IFS=','; for l in $labels; do
+			[ "$DRY_RUN" = true ] && print_dry_run "Would add label '$l' to issue #$issue_number" || gh issue edit "$issue_number" --add-label "$l" >/dev/null 2>&1 || true
+		done
+	}
+	[ -n "$milestone" ] && {
+		[ "$DRY_RUN" = true ] && print_dry_run "Would set milestone '$milestone' on issue #$issue_number" || gh issue edit "$issue_number" --milestone "$milestone" >/dev/null 2>&1 || true
+	}
+}
+
+apply_pr_metadata() {
+	# args: branch assignees_csv reviewers_csv labels_csv milestone pr_meta_enabled project_name pr_status
+	local branch="$1"; local assignees="$2"; local reviewers="$3"; local labels="$4"; local milestone="$5"; local pr_meta_enabled="$6"; local project_name="$7"; local pr_status="$8"
+	[ -n "$assignees" ] && {
+		local IFS=','; for a in $assignees; do
+			[ "$DRY_RUN" = true ] && print_dry_run "Would add PR assignee $a" || gh pr edit "$branch" --add-assignee "$a" >/dev/null 2>&1 || true
+		done
+	}
+	[ -n "$reviewers" ] && {
+		local IFS=','; for r in $reviewers; do
+			[ "$DRY_RUN" = true ] && print_dry_run "Would add PR reviewer $r" || gh pr edit "$branch" --add-reviewer "$r" >/dev/null 2>&1 || true
+		done
+	}
+	[ -n "$labels" ] && {
+		local IFS=','; for l in $labels; do
+			[ "$DRY_RUN" = true ] && print_dry_run "Would add PR label $l" || gh pr edit "$branch" --add-label "$l" >/dev/null 2>&1 || true
+		done
+	}
+	[ -n "$milestone" ] && {
+		[ "$DRY_RUN" = true ] && print_dry_run "Would set PR milestone '$milestone'" || gh pr edit "$branch" --milestone "$milestone" >/dev/null 2>&1 || true
+	}
+	if [ "$pr_meta_enabled" = true ]; then
+		[ -n "$project_name" ] && { [ "$DRY_RUN" = true ] && print_dry_run "Would add PR to project '$project_name'" || gh pr edit "$branch" --add-project "$project_name" >/dev/null 2>&1 || true; }
+		# Note: PR Status in project will be handled via project_status_apply on PR URL when needed
+	fi
+}
+
+link_parent_fallback() {
+	# CLI does not have a first-class sub-issue command; fall back to mutual comments
+	local child="$1"; local parent_input="$2"
+	[ -z "$parent_input" ] && return 0
+	local parent=$(echo "$parent_input" | sed -E 's#.*/issues/([0-9]+).*#\1#; s/^#([0-9]+)/\1/')
+	[[ "$parent" =~ ^[0-9]+$ ]] || { print_info "Warning: Could not resolve parent from '$parent_input'"; return 0; }
+	if [ "$DRY_RUN" = true ]; then
+		print_dry_run "Would comment on parent #$parent: 'Linked sub-issue #$child'"
+		print_dry_run "Would comment on child #$child: 'Parent issue #$parent'"
+	else
+		gh issue comment "$parent" --body "Linked sub-issue #$child" >/dev/null 2>&1 || true
+		gh issue comment "$child" --body "Parent issue #$parent" >/dev/null 2>&1 || true
+	fi
+}
+
+update_or_create_pr() {
+	# args: issue_number issue_title assignees reviewers labels milestone pr_meta_enabled project_name pr_status
+	local issue_number="$1"; local issue_title="$2"; local assignees="$3"; local reviewers="$4"; local labels="$5"; local milestone="$6"; local pr_meta_enabled="$7"; local project_name="$8"; local pr_status="$9"
+	local branch=$(git rev-parse --abbrev-ref HEAD)
+	# Build PR body from commits and link issue
+	local base=$(git merge-base origin/main HEAD 2>/dev/null || echo "origin/main")
+	local body=$(git log --pretty="- **%s**" --reverse "$base"..HEAD 2>/dev/null || echo "")
+	body=$(printf "%s\nCloses #%s" "$body" "$issue_number")
+	# Create or update
+	if gh pr view "$branch" --json number >/dev/null 2>&1; then
+		print_info "Updating PR for $branch"
+		[ "$DRY_RUN" = true ] && print_dry_run "Would update PR title/body" || gh pr edit "$branch" -t "feat: $issue_title" -b "$body" >/dev/null 2>&1 || true
+	else
+		print_info "Creating PR for $branch"
+		if [ "$DRY_RUN" = true ]; then
+			print_dry_run "Would create PR with title 'feat: $issue_title'"
+		else
+			gh pr create --head "$branch" --base main --title "feat: $issue_title" --body "$body" --fill >/dev/null 2>&1 || true
+		fi
+	fi
+	apply_pr_metadata "$branch" "$assignees" "$reviewers" "$labels" "$milestone" "$pr_meta_enabled" "$project_name" "$pr_status"
+	if [ -n "$project_name" ] && [ -n "$pr_status" ] && [ "$pr_meta_enabled" = true ]; then
+		# Try to set project status for PR item as well
+		local pr_url=$(gh pr view "$branch" --json url --jq '.url' 2>/dev/null || echo "")
+		if [ -n "$pr_url" ]; then
+			local owner="${GH_REPO%%/*}"; local ids=$(resolve_project_ids "$project_name")
+			local project_id="${ids%%|*}"; local project_number="${ids#*|}"
+			local fields_json=$(gh project field-list "$project_number" --owner "$owner" --format json 2>/dev/null || echo "")
+			local status_field_id=$(echo "$fields_json" | jq -r '.fields[] | select(.name=="Status") | .id' | head -n1)
+			local todo_id=$(echo "$fields_json" | jq -r '.fields[] | select(.name=="Status") | .options[] | select(.name=="Todo") | .id' | head -n1)
+			local ip_id=$(echo "$fields_json" | jq -r '.fields[] | select(.name=="Status") | .options[] | select(.name=="In Progress") | .id' | head -n1)
+			local done_id=$(echo "$fields_json" | jq -r '.fields[] | select(.name=="Status") | .options[] | select(.name=="Done") | .id' | head -n1)
+			local opt=""
+			case "$pr_status" in
+				in-progress|"in progress"|progress) opt="$ip_id" ;;
+				todo) opt="$todo_id" ;;
+				done|complete|completed) opt="$done_id" ;;
+			esac
+			if [ -n "$project_id" ] && [ -n "$project_number" ] && [ -n "$status_field_id" ] && [ -n "$opt" ]; then
+				local item_id=""
+				if [ "$DRY_RUN" = true ]; then
+					item_id="dry-pr-item"
+					print_dry_run "Would add PR to project and set Status to '$pr_status'"
+				else
+					item_id=$(gh project item-add "$project_number" --owner "$owner" --url "$pr_url" --format json --jq '.id' 2>/dev/null || echo "")
+				fi
+				[ -n "$item_id" ] && { [ "$DRY_RUN" = true ] && print_dry_run "Would set PR project Status" || gh project item-edit --id "$item_id" --field-id "$status_field_id" --project-id "$project_id" --single-select-option-id "$opt" >/dev/null 2>&1 || true; }
+			fi
+		fi
+	fi
+}
+
+# --- Actions ---
+action_create() {
+	local issue_title="$1"; shift || true
+	[ -z "$issue_title" ] && die "Title is required"
+
+	# Parse flags to forward to gh issue create and local behavior
+    local forwarded=( )
+    local parent="" assignees="" reviewers="" labels="" milestone="" project_name="" pr_meta=false issue_status="" issue_type="" iteration="" body_source=""
+	local i=1; while [ $i -le $# ]; do
+		local a="${@[$i]}"
+        case "$a" in
+            --dry-run) DRY_RUN=true ;;
+			-t|--type) i=$((i+1)); issue_type="${@[$i]}"; forwarded+=("-t" "$issue_type") ;;
+			-P|--parent) i=$((i+1)); parent="${@[$i]}" ;;
+			-p|--project) i=$((i+1)); project_name="${@[$i]}" ;;
+			-s|--status) i=$((i+1)); issue_status="${@[$i]}" ;;
+			-M|--pr-meta) pr_meta=true ;;
+			-i|--iteration) i=$((i+1)); iteration="${@[$i]}" ;;
+			-a|--assignee) i=$((i+1)); local v="${@[$i]}"; assignees=${assignees:+"$assignees,"}$v; forwarded+=("-a" "$v") ;;
+			-r|--reviewer) i=$((i+1)); local v="${@[$i]}"; reviewers=${reviewers:+"$reviewers,"}$v ;;
+			-l|--label) i=$((i+1)); local v="${@[$i]}"; labels=${labels:+"$labels,"}$v; forwarded+=("-l" "$v") ;;
+			-m|--milestone) i=$((i+1)); milestone="${@[$i]}"; forwarded+=("-m" "$milestone") ;;
+			-b|--body) i=$((i+1)); body_source="inline"; forwarded+=("-b" "${@[$i]}") ;;
+			-F|--body-file) i=$((i+1)); body_source="@${@[$i]}"; forwarded+=("-F" "${@[$i]}") ;;
+			-e|--editor) body_source="editor"; forwarded+=("-e") ;;
+			*) forwarded+=("$a") ;;
+		esac
+		i=$((i+1))
+	done
+
+	# defaults
+	[ -z "$assignees" ] && { assignees="@me"; forwarded+=("-a" "@me"); }
+	[ -n "$project_name" ] && [ -z "$issue_status" ] && issue_status="in-progress"
+	[ -z "$issue_type" ] && issue_type="Feature"
+
+    local titled="$issue_title"
+	print_step "Creating GitHub issue"
+	if [ "$DRY_RUN" = true ]; then
+		print_dry_run "Would run: gh issue create --repo $GH_REPO --title '$titled' ${forwarded[*]}"
+		local issue_number="99"
+	else
+		local out
+		out=$(gh issue create --repo "$GH_REPO" --title "$titled" -b "" ${forwarded[@]} 2>&1) || die "Failed to create issue: $out"
+		local url=$(echo "$out" | grep -Eo 'https://github.com/[^ ]+/issues/[0-9]+' | tail -n1)
+		local issue_number=$(echo "$url" | sed -E 's#.*/issues/([0-9]+).*#\1#')
+		[ -z "$issue_number" ] && die "Could not determine created issue number"
+	fi
+
+	# Open the created issue in browser (best-effort)
+	[ "$DRY_RUN" = true ] && print_dry_run "Would open issue #$issue_number in browser" || gh issue view --repo "$GH_REPO" "$issue_number" --web >/dev/null 2>&1 || true
+
+	# Fetch title for branch and build branch name
+	local fetched_title
+	if [ "$DRY_RUN" = true ]; then
+		fetched_title="$titled"
+	else
+		fetched_title=$(gh issue view --repo "$GH_REPO" "$issue_number" --json title --jq '.title' | tr -d '\n')
+	fi
+	local base_title="$fetched_title"
+	local branch=$(branch_name_for_issue "$issue_number" "$base_title")
+
+	# Create branch using 'gh issue develop' (gh-only)
+	print_step "Creating branch $branch"
+	if [ "$DRY_RUN" = true ]; then
+		print_dry_run "Would run: gh issue develop $issue_number -b $branch"
+	else
+		git fetch -q origin || true
+		git checkout -q main
+		git pull -q --ff-only origin main || true
+		gh issue develop "$issue_number" -b "$branch" >/dev/null 2>&1 || {
+			# fallback: create branch manually if develop not available
+			git checkout -q -b "$branch" origin/main
+		}
+	fi
+
+	# Create commit if needed
+	create_commit_if_needed "$base_title"
+	push_set_upstream "$branch"
+
+	# Apply issue metadata independent of PR
+	apply_issue_metadata "$issue_number" "$assignees" "$labels" "$milestone"
+
+	# Create/update PR with metadata
+	update_or_create_pr "$issue_number" "$base_title" "$assignees" "$reviewers" "$labels" "$milestone" "$pr_meta" "$project_name" "$issue_status"
+
+	# Project status / iteration on issue
+	[ -n "$project_name" ] && project_status_apply "$issue_number" "$project_name" "$issue_status" "$iteration"
+
+	# Parent linking (fallback via comments)
+	[ -n "$parent" ] && link_parent_fallback "$issue_number" "$parent"
+
+	echo "$issue_number|$issue_title|$branch|$parent|assignee=$assignees labels=$labels milestone=$milestone${project_name:+ project=$project_name}${issue_status:+ status=$issue_status}${iteration:+ iteration=$iteration}"
+}
+
+action_connect() {
+	local issue_input="$1"; shift || true
+	[ -z "$issue_input" ] && die "Connect requires an existing issue number (#123 or URL)"
+    local parent="" assignees="" reviewers="" labels="" milestone="" project_name="" pr_meta=false issue_status="" issue_type="" iteration=""
+	local i=1; while [ $i -le $# ]; do
+		local a="${@[$i]}"
+        case "$a" in
+            --dry-run) DRY_RUN=true ;;
+			-P|--parent) i=$((i+1)); parent="${@[$i]}" ;;
+			-s|--status) i=$((i+1)); issue_status="${@[$i]}" ;;
+			-p|--project) i=$((i+1)); project_name="${@[$i]}" ;;
+			-M|--pr-meta) pr_meta=true ;;
+			-t|--type) i=$((i+1)); issue_type="${@[$i]}" ;;
+			-i|--iteration) i=$((i+1)); iteration="${@[$i]}" ;;
+			-a|--assignee) i=$((i+1)); local v="${@[$i]}"; assignees=${assignees:+"$assignees,"}$v ;;
+			-r|--reviewer) i=$((i+1)); local v="${@[$i]}"; reviewers=${reviewers:+"$reviewers,"}$v ;;
+			-l|--label) i=$((i+1)); local v="${@[$i]}"; labels=${labels:+"$labels,"}$v ;;
+			-m|--milestone) i=$((i+1)); milestone="${@[$i]}" ;;
+			*) : ;;
+		esac
+		i=$((i+1))
+	done
+	[ -z "$assignees" ] && assignees="@me"
+	[ -n "$project_name" ] && [ -z "$issue_status" ] && issue_status="in-progress"
+
+	local issue_number=$(echo "$issue_input" | sed -E 's#.*/issues/([0-9]+).*#\1#; s/^#([0-9]+)/\1/')
+	[[ "$issue_number" =~ ^[0-9]+$ ]] || die "Provide a valid issue number (#123 or URL)"
+
+	local issue_title
+    if [ "$DRY_RUN" = true ]; then
+        issue_title="(dry) connected issue"
+        print_dry_run "Would open issue #$issue_number in browser"
+    else
+        issue_title=$(gh issue view --repo "$GH_REPO" "$issue_number" --json title --jq '.title' | tr -d '\n')
+        [ -z "$issue_title" ] && die "Could not fetch issue #$issue_number"
+        gh issue view --repo "$GH_REPO" "$issue_number" --web >/dev/null 2>&1 || true
+    fi
+
+    local base_title="$issue_title"
+	local branch=$(branch_name_for_issue "$issue_number" "$base_title")
+
+	print_step "Creating branch $branch from issue #$issue_number"
+	if [ "$DRY_RUN" = true ]; then
+		print_dry_run "Would run: gh issue develop $issue_number -b $branch"
+	else
+		git fetch -q origin || true
+		git checkout -q main
+		git pull -q --ff-only origin main || true
+		gh issue develop "$issue_number" -b "$branch" >/dev/null 2>&1 || git checkout -q -b "$branch" origin/main
+	fi
+
+	create_commit_if_needed "$base_title"
+	push_set_upstream "$branch"
+
+	apply_issue_metadata "$issue_number" "$assignees" "$labels" "$milestone"
+	update_or_create_pr "$issue_number" "$base_title" "$assignees" "$reviewers" "$labels" "$milestone" "$pr_meta" "$project_name" "$issue_status"
+	[ -n "$project_name" ] && project_status_apply "$issue_number" "$project_name" "$issue_status" "$iteration"
+	[ -n "$parent" ] && link_parent_fallback "$issue_number" "$parent"
+
+	echo "$issue_number:$issue_title:$branch:$(git rev-parse --abbrev-ref @{-1} 2>/dev/null || echo '-')"
+}
+
+action_rename() {
+	local new_title="$1"; [ -z "$new_title" ] && die "New title required"
+	local branch=$(git rev-parse --abbrev-ref HEAD)
+	case "$branch" in
+		issue/*-*) : ;;
+		*) die "Current branch must be in 'issue/<number>-<slug>' format to rename" ;;
+	esac
+	local issue_number=$(echo "$branch" | sed -E 's#^issue/([0-9]+)-.*#\1#')
+	print_step "Renaming issue #$issue_number and branch"
+	[ "$DRY_RUN" = true ] && print_dry_run "Would gh issue edit $issue_number --title '$new_title'" || gh issue edit "$issue_number" --title "$new_title" >/dev/null 2>&1 || true
+	local new_branch="issue/$issue_number-$(slugify_title "$new_title")"
+	[ "$DRY_RUN" = true ] && print_dry_run "Would git branch -m $new_branch" || git branch -m "$new_branch"
+	create_commit_if_needed "$new_title"
+	push_set_upstream "$new_branch"
+	update_or_create_pr "$issue_number" "$new_title" "" "" "" "" false "" ""
+	echo "$issue_number:$new_title:$new_branch"
+}
+
+action_delete() {
+	local branch=$(git rev-parse --abbrev-ref HEAD)
+	case "$branch" in
+		issue/*-*) : ;;
+		*) die "Branch must be 'issue/<number>-<slug>' to delete" ;;
+	esac
+	local issue_number=$(echo "$branch" | sed -E 's#^issue/([0-9]+)-.*#\1#')
+	print_step "Deleting resources for $branch"
+	[ "$DRY_RUN" = true ] && print_dry_run "Would gh issue delete $issue_number" || gh issue delete "$issue_number" >/dev/null 2>&1 || true
+	local pr_number=$(gh pr view "$branch" --json number --jq '.number' 2>/dev/null || echo "")
+	[ -n "$pr_number" ] && { [ "$DRY_RUN" = true ] && print_dry_run "Would gh pr close $pr_number" || gh pr close "$pr_number" --delete-branch=false >/dev/null 2>&1 || true; }
+	if git ls-remote --heads origin "$branch" | grep -q "$branch"; then
+		[ "$DRY_RUN" = true ] && print_dry_run "Would delete remote branch $branch" || git push origin --delete "$branch" >/dev/null 2>&1 || true
+	fi
+	[ "$DRY_RUN" = true ] && print_dry_run "Would checkout main and delete local $branch" || { git checkout -q main || true; git branch -D "$branch" >/dev/null 2>&1 || true; }
+	echo "$branch:$issue_number:${pr_number:-}"
+}
+
+action_pr() {
+	local branch=$(git rev-parse --abbrev-ref HEAD)
+	case "$branch" in
+		issue/*-*) : ;;
+		*) die "Branch must be 'issue/<number>-<slug>'" ;;
+	esac
+	local issue_number=$(echo "$branch" | sed -E 's#^issue/([0-9]+)-.*#\1#')
+	local issue_title=$(gh issue view --repo "$GH_REPO" "$issue_number" --json title --jq '.title' 2>/dev/null || echo "Issue $issue_number")
+	print_step "Updating or creating PR for $branch"
+	update_or_create_pr "$issue_number" "$issue_title" "" "" "" "" false "" ""
+	local info=$(gh pr view "$branch" --json number,title,url)
+	local pr_number=$(echo "$info" | jq -r '.number')
+	local pr_title=$(echo "$info" | jq -r '.title')
+	local pr_url=$(echo "$info" | jq -r '.url')
+	echo "$pr_number:$pr_title:$branch:$( [ -n "$pr_url" ] && echo true || echo false):$pr_url"
+}
+
+action_cr() {
+	local msg="$1"
+	local branch=$(git rev-parse --abbrev-ref HEAD)
+	gh pr view "$branch" --json number,title,url >/dev/null 2>&1 || die "No PR found for $branch"
+	print_step "Requesting code review"
+	# Update PR body from commits
+	update_or_create_pr "" "" "" "" "" "" false "" "" >/dev/null 2>&1 || true
+	local pr_info=$(gh pr view "$branch" --json number,title,url)
+	local pr_number=$(echo "$pr_info" | jq -r '.number')
+	local pr_title=$(echo "$pr_info" | jq -r '.title')
+	local pr_url=$(echo "$pr_info" | jq -r '.url')
+	# Ready for review if draft
+	local is_draft=$(gh pr view "$pr_number" --json isDraft --jq '.isDraft')
+	if [ "$is_draft" = "true" ]; then
+		[ "$DRY_RUN" = true ] && print_dry_run "Would mark PR #$pr_number ready" || gh pr ready "$pr_number" >/dev/null 2>&1 || true
+	fi
+	# Add run-ci label
+	[ "$DRY_RUN" = true ] && print_dry_run "Would add 'run-ci' label to PR #$pr_number" || gh pr edit "$pr_number" --add-label "run-ci" >/dev/null 2>&1 || true
+	# Slack notify
+	local text
+	if [ -n "$msg" ]; then text="$pr_url - $msg"; else text="$pr_url - $pr_title"; fi
+	send_slack_cr_request "$text"
+	echo "$pr_number|$pr_title|$branch|$text"
+}
+
+action_wf() {
+	local wf="$1"; shift || true
+	[ -z "$wf" ] && die "Workflow name is required"
+	local branch=$(git rev-parse --abbrev-ref HEAD)
+	print_step "Running workflow '$wf'"
+	if [ "$DRY_RUN" = true ]; then
+		print_dry_run "Would run: gh workflow run $wf --ref $branch $*"
+	else
+		gh workflow run "$wf" --ref "$branch" "$@" || die "Failed to start workflow '$wf'"
+		sleep 2
+		local rid=$(gh run list --workflow="$wf" --limit=1 --json databaseId --jq '.[0].databaseId')
+		[ -n "$rid" ] && gh run view --web "$rid" || die "Could not find latest run for '$wf'"
+	fi
+	echo "$wf|$branch|$*"
+}
+
+print_summary() {
+	local action="$1"; local result="$2"
+	case "$action" in
+		create)
+			local n=$(echo "$result" | cut -d'|' -f1); local t=$(echo "$result" | cut -d'|' -f2); local b=$(echo "$result" | cut -d'|' -f3); local p=$(echo "$result" | cut -d'|' -f4); local info=$(echo "$result" | cut -d'|' -f5-)
+			print_info "Created issue #$n with PR and branch attached"
+			[ -n "$info" ] && print_info "($info)"
+		;;
+		rename)
+			local n=$(echo "$result" | cut -d: -f1); local t=$(echo "$result" | cut -d: -f2); local b=$(echo "$result" | cut -d: -f3)
+			print_info "Renamed issue #$n and branch to $b"
+		;;
+		connect)
+			local n=$(echo "$result" | cut -d: -f1); local t=$(echo "$result" | cut -d: -f2); local b=$(echo "$result" | cut -d: -f3)
+			print_info "Connected branch to issue #$n and created PR $b"
+		;;
+		cr)
+			local p=$(echo "$result" | cut -d'|' -f1); print_info "Code review requested for PR #$p" ;;
+		wf)
+			local w=$(echo "$result" | cut -d'|' -f1); print_info "Workflow '$w' started" ;;
+		pr)
+			local pn=$(echo "$result" | cut -d: -f1); local b=$(echo "$result" | cut -d: -f3)
+			print_info "Updated/created PR #$pn for branch $b" ;;
+		delete)
+			local br=$(echo "$result" | cut -d: -f1); local is=$(echo "$result" | cut -d: -f2); local pr=$(echo "$result" | cut -d: -f3)
+			print_info "Deleted branch $br and closed issue #$is${pr:+ and PR #$pr}" ;;
+	esac
+}
+
+usage() {
+	print_info "Usage: ghs create \"Issue title\" [flags] | ghs connect <#num|url> [flags] | ghs rename \"New title\" | ghs delete | ghs cr [\"message\"] | ghs wf <workflow> [args...] | ghs pr"
+	print_info "Status options: --status|-s [in-progress|todo|done]"
+	print_info "Iteration: --iteration|-i <number> (requires --project)"
+	print_info "Project: --project|-p <Project Title>"
+	print_info "Parent: --parent|-P <#issue|url> (adds cross-link comments)"
+	print_info "PR meta: -M/--pr-meta also applies project, status, and milestone to the PR (issue always updated)"
+	print_info "Issue type: -t/--type (Feature, Bug, Task, etc.)"
+	print_info "Assignees/Reviewers/Labels/Milestone supported"
+	print_info "Use --dry-run to preview actions"
+}
+
+main() {
+    if [ "$1" = "-h" ] || [ "$1" = "--help" ] || [ "$1" = "help" ]; then
+        usage
+        exit 0
+    fi
+    ensure_git_repo; ensure_gh; ensure_gh_auth; ensure_repo_context
+	local action="$1"; shift || true
+	local result="" action_status=0
+	case "$action" in
+		create)
+			local title="$1"; shift || true
+			[ -z "$title" ] && { usage; exit 1; }
+			result=$(action_create "$title" "$@") || action_status=$?
+		;;
+		connect)
+			[ -z "$1" ] && { usage; exit 1; }
+			result=$(action_connect "$@") || action_status=$?
+		;;
+		rename)
+			[ -z "$1" ] && { usage; exit 1; }
+			result=$(action_rename "$1") || action_status=$?
+		;;
+		delete)
+			result=$(action_delete) || action_status=$?
+		;;
+		cr)
+			result=$(action_cr "$1") || action_status=$?
+		;;
+		wf)
+			[ -z "$1" ] && { usage; exit 1; }
+			local wf="$1"; shift || true
+			result=$(action_wf "$wf" "$@") || action_status=$?
+		;;
+		pr)
+			result=$(action_pr) || action_status=$?
+		;;
+		*) usage; exit 1 ;;
+	 esac
+	[ $action_status -ne 0 ] && exit $action_status
+	print_summary "$action" "$result"
+}
+
+main "$@"
+
+

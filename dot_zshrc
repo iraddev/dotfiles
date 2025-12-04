@@ -1,0 +1,297 @@
+# Set default values for commonly referenced variables to avoid parameter errors
+# This is especially important for Warp terminal compatibility
+export DISABLE_UPDATE_PROMPT=${DISABLE_UPDATE_PROMPT:-"false"}
+export ZSH_COMPDUMP=${ZSH_COMPDUMP:-"$HOME/.zcompdump"}
+export POWERLEVEL9K_PROMPT_ADD_NEWLINE=${POWERLEVEL9K_PROMPT_ADD_NEWLINE:-"false"}
+export INSIDE_EMACS=${INSIDE_EMACS:-""}
+export WARP_DISABLE_AUTO_TITLE=${WARP_DISABLE_AUTO_TITLE:-"false"}
+
+# Path to your Oh My Zsh installation.
+export ZSH="$HOME/.oh-my-zsh"
+
+# Clone Oh My Zsh if it's not installed yet
+if [ ! -d "$ZSH" ]; then
+  echo "Oh My Zsh not found, cloning into $ZSH..."
+  git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$ZSH"
+fi
+
+# Set cache directory for Oh My Zsh
+export ZSH_CACHE_DIR="$ZSH/cache"
+
+# Set XDG Config directory
+export XDG_CONFIG_HOME="$HOME/.config"
+
+# Starship prompt
+eval "$(starship init zsh)"
+
+# Add scripts to PATH
+export PATH="$XDG_CONFIG_HOME/zsh:$PATH"
+
+# Which plugins would you like to load?
+# Standard plugins can be found in $ZSH/plugins/
+# Custom plugins may be added to $ZSH_CUSTOM/plugins/
+# Example format: plugins=(rails git textmate ruby lighthouse)
+# Add wisely, as too many plugins slow down shell startup.
+plugins=(git kubectl eza)
+
+source $ZSH/oh-my-zsh.sh
+
+# Set up fzf key bindings and fuzzy completion
+source <(fzf --zsh)
+
+# User configuration
+
+# export MANPATH="/usr/local/man:$MANPATH"
+
+# You may need to manually set your language environment
+# export LANG=en_US.UTF-8
+
+setopt EXTENDED_GLOB
+
+# Preferred editor for local and remote sessions
+if [[ -n "${SSH_CONNECTION:-}" ]]; then
+  export EDITOR='vim'
+else
+  export EDITOR='nvim'
+fi
+
+# Compilation flags
+export ARCHFLAGS="-arch $(uname -m)"
+
+# GOPATH
+export GOPATH=$HOME/.go
+export PATH=$GOPATH/bin:$HOME/bin:$HOME/.local/bin:/usr/local/bin:$PATH
+
+# Set personal aliases, overriding those provided by Oh My Zsh libs,
+# plugins, and themes. Aliases can be placed here, though Oh My Zsh
+# users are encouraged to define aliases within a top-level file in
+# the $ZSH_CUSTOM folder, with .zsh extension. Examples:
+# - $ZSH_CUSTOM/aliases.zsh
+# - $ZSH_CUSTOM/macos.zsh
+# For a full list of active aliases, run `alias`.
+#
+# Example aliases
+# alias zshconfig="mate ~/.zshrc"
+# alias ohmyzsh="mate ~/.oh-my-zsh"
+
+# Prefer Neovim whenever available
+alias vim='nvim'
+alias vi='nvim'      # optional, for old muscle-memory
+alias view='nvim -R' # optional, read-only view mode
+# Other Aliases
+alias loadenv='set -a && source .env && set +a'
+alias setenv='echo $1 >> .env'
+alias readenv="grep -v '^#' .env | grep -v '^$'"
+alias novee='cursor $HOME/Developer/novee/novee.code-workspace'
+alias lg=lazygit
+alias tm='task-master'
+alias novee-gen='pushd ~/Developer/novee/scripts/gen && go run gen.go --mode'
+alias du='dust'
+alias ll='eza -lh --icons=always'
+alias tar='ouch'
+alias find='fd'
+alias grep='rg'
+alias cd='z'
+alias assume='aws sso login'
+ssh-aws() {
+    if [ $# -eq 0 ]; then
+        echo "Usage: ssh-aws <hostname> (e.g., ip-172-31-84-165)"
+        return 1
+    fi
+    local hostname="$1.ec2.internal"
+    aws ec2-instance-connect ssh --os-user ubuntu --instance-id $(aws ec2 describe-instances --filters "Name=private-dns-name,Values=$hostname" --query "Reservations[*].Instances[*].InstanceId" --output text)
+}
+killport() {
+  if [ -z "$1" ]; then
+    echo "Usage: killport <port>"
+    return 1
+  fi
+  # find the process IDs using the given port, then kill them
+  PIDS=$(lsof -t -i:"$1" 2>/dev/null)
+  if [ -n "$PIDS" ]; then
+    sudo kill -9 $PIDS
+    echo "Killed processes on port $1: $PIDS"
+  else
+    echo "No process found on port $1"
+  fi
+}
+alias kns='kubens'
+alias kctx='kubectx'
+
+# Produce to a topic interactively
+kproduce() {
+  if [ -z "$1" ]; then
+    echo "Usage: kproduce <topic>"
+    return 1
+  fi
+  local topic="$1"
+  shift
+  local extra_args="$*"
+  local pod_name="kafka-producer-$$"
+  
+  # Set up trap to delete pod on interrupt
+  trap "kubectl delete pod -n novee $pod_name --ignore-not-found=true >/dev/null 2>&1" INT TERM
+  
+  kubectl run -n novee "$pod_name" --image=quay.io/strimzi/kafka:0.48.0-kafka-4.1.0 --restart=Never -it --rm --overrides='{
+      "spec": {
+        "containers": [{
+          "name": "kafka-producer",
+          "image": "quay.io/strimzi/kafka:0.48.0-kafka-4.1.0",
+          "command": ["sh", "-c"],
+          "args": ["/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server \"$BOOTSTRAP_SERVERS\" --producer.config <(cat <<EOF\nsasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username=\"$USERNAME\" password=\"$PASSWORD\";\nsecurity.protocol=$SECURITY_PROTOCOL\nsasl.mechanism=$SASL_MECHANISM\nEOF\n) --topic '"$topic"' '"$extra_args"'"],
+          "stdin": true,
+          "tty": true,
+          "securityContext": {
+            "runAsUser": 0,
+            "runAsGroup": 0,
+            "allowPrivilegeEscalation": true
+          },
+          "envFrom": [{
+            "secretRef": {
+              "name": "novee-kafka-access-novee"
+            }
+          }],
+          "env": [
+            {"name": "BOOTSTRAP_SERVERS", "valueFrom": {"secretKeyRef": {"name": "novee-kafka-access-novee", "key": "bootstrap.servers"}}},
+            {"name": "USERNAME", "valueFrom": {"secretKeyRef": {"name": "novee-kafka-access-novee", "key": "username"}}},
+            {"name": "PASSWORD", "valueFrom": {"secretKeyRef": {"name": "novee-kafka-access-novee", "key": "password"}}},
+            {"name": "SECURITY_PROTOCOL", "valueFrom": {"secretKeyRef": {"name": "novee-kafka-access-novee", "key": "securityProtocol"}}},
+            {"name": "SASL_MECHANISM", "valueFrom": {"secretKeyRef": {"name": "novee-kafka-access-novee", "key": "saslMechanism"}}}
+          ]
+        }],
+        "restartPolicy": "Never"
+      }
+    }'
+  
+  # Clean up trap
+  trap - INT TERM
+}
+
+# Consume from a topic (tails new messages)
+kconsume() {
+  if [ -z "$1" ]; then
+    echo "Usage: kconsume <topic> [additional-params...]"
+    return 1
+  fi
+  local topic="$1"
+  shift
+  local extra_args="$*"
+  kubectl run -n novee kafka-consumer --image=quay.io/strimzi/kafka:0.48.0-kafka-4.1.0 --restart=Never -i --rm --overrides='{
+      "spec": {
+        "containers": [{
+          "name": "kafka-consumer",
+          "image": "quay.io/strimzi/kafka:0.48.0-kafka-4.1.0",
+          "command": ["sh", "-c"],
+          "args": ["/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server \"$BOOTSTRAP_SERVERS\" --consumer.config <(cat <<EOF\nsasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username=\"$USERNAME\" password=\"$PASSWORD\";\nsecurity.protocol=$SECURITY_PROTOCOL\nsasl.mechanism=$SASL_MECHANISM\nEOF\n) --topic '"$topic"' '"$extra_args"'"],
+          "stdin": true,
+          "tty": false,
+          "securityContext": {
+            "runAsUser": 0,
+            "runAsGroup": 0,
+            "allowPrivilegeEscalation": true
+          },
+          "envFrom": [{
+            "secretRef": {
+              "name": "novee-kafka-access-novee"
+            }
+          }],
+          "env": [
+            {"name": "BOOTSTRAP_SERVERS", "valueFrom": {"secretKeyRef": {"name": "novee-kafka-access-novee", "key": "bootstrap.servers"}}},
+            {"name": "USERNAME", "valueFrom": {"secretKeyRef": {"name": "novee-kafka-access-novee", "key": "username"}}},
+            {"name": "PASSWORD", "valueFrom": {"secretKeyRef": {"name": "novee-kafka-access-novee", "key": "password"}}},
+            {"name": "SECURITY_PROTOCOL", "valueFrom": {"secretKeyRef": {"name": "novee-kafka-access-novee", "key": "securityProtocol"}}},
+            {"name": "SASL_MECHANISM", "valueFrom": {"secretKeyRef": {"name": "novee-kafka-access-novee", "key": "saslMechanism"}}}
+          ]
+        }],
+        "restartPolicy": "Never"
+      }
+    }'
+  
+  # Clean up trap
+  trap - INT TERM
+}
+
+kpsql() {
+  if [ -z "$1" ]; then
+    echo "Usage: kpsql <query>"
+    return 1
+  fi
+  
+  # Wrap query in json_agg for JSON output
+  local query="$1"
+  local json_query="SELECT json_agg(t) FROM ($query) t;"
+  
+  kubectl run -n novee psql-query --image=postgres:16-alpine --restart=Never -i --rm --quiet=false --overrides='
+  {
+    "spec": {
+      "containers": [{
+        "name": "psql-query",
+        "image": "postgres:16-alpine",
+        "stdin": true,
+        "tty": false,
+        "command": ["sh", "-c", "exec psql --host=\"$DATABASE_HOST\" --port=\"$DATABASE_PORT\" --username=\"$DATABASE_USERNAME\" --dbname=novee --set=sslmode=require --pset=pager=off -t -A -c \"'"$json_query"'\""],
+        "env": [
+          {
+            "name": "PGPASSWORD",
+            "valueFrom": {
+              "secretKeyRef": {
+                "name": "rds",
+                "key": "DATABASE_PASSWORD"
+              }
+            }
+          }
+        ],
+        "envFrom": [{
+          "secretRef": {
+            "name": "rds"
+          }
+        }]
+      }],
+      "restartPolicy": "Never"
+    }
+  }' 2>/dev/null
+}
+# Tell coreutils & grep to use ANSI colours
+alias ls='ls -G'          # Linux: alias ls='ls --color=auto'
+export CLICOLOR=1
+export LSCOLORS=ExFxCxDxBxegedabagacad        # macOS palette
+export LS_COLORS='rs=0:di=01;34:ln=01;36'     # GNU palette
+export GREP_OPTIONS='--color=auto'
+
+# Recommended output token settings for Bedrock
+export CLAUDE_CODE_USE_BEDROCK=1
+export ANTHROPIC_MODEL="us.anthropic.claude-sonnet-4-20250514-v1:0"
+export PATH="$HOME/.local/bin:$PATH"
+
+# Make sure interactive programs know we have 256 colours
+export TERM=xterm-256color   # Warp defaults to 'wezterm'; override if needed
+
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+
+export PYENV_ROOT="$HOME/.pyenv"
+[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init - zsh)"
+autoload -Uz compinit && compinit
+
+eval "$(zoxide init zsh)"
+export _ZO_DOCTOR=0
+
+export SSH_AUTH_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+export PATH="/opt/homebrew/opt/gnu-tar/libexec/gnubin:$PATH"
+export PATH="/opt/homebrew/opt/ruby/bin:/opt/homebrew/lib/ruby/gems/3.4.0/bin:$PATH"
+# OpenSSL paths for compilation
+export LDFLAGS="-L/opt/homebrew/opt/openssl@3/lib $LDFLAGS"
+export CPPFLAGS="-I/opt/homebrew/opt/openssl@3/include $CPPFLAGS" export PKG_CONFIG_PATH="/opt/homebrew/opt/openssl@3/lib/pkgconfig:$PKG_CONFIG_PATH"
+export HOMEBREW_NO_ENV_HINTS=1
+
+# opencode
+export PATH=/Users/irad/.opencode/bin:$PATH
+
+fpath+=~/.zfunc; autoload -Uz compinit; compinit
+
+zstyle ':completion:*' menu select
+
+# Added by Antigravity
+export PATH="/Users/irad/.antigravity/antigravity/bin:$PATH"

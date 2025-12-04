@@ -1,0 +1,30 @@
+# Default to work user
+[user]
+	name = Irad Aharoni
+	email = irad@novee.io
+
+[core]
+	sshCommand = ssh -o IdentityAgent=~/.1password/agent.sock
+	editor = vim
+
+[credential]
+    helper = !/opt/homebrew/bin/gh auth git-credential
+
+[alias]
+	ac = !git add -A && git commit -m
+	pfm = push origin HEAD:main --force-with-lease
+	undo = reset HEAD~
+	squash = "!f() { git reset --soft HEAD~$1 && git commit; }; f"
+	acp = !git add -A && git commit --amend -a --no-edit && git push --force-with-lease
+
+[push]
+	autoSetupRemote = true
+	default = current
+[pull]
+	rebase = true
+[init]
+	defaultBranch = main
+
+# Personal user for specific directory (overrides default)
+[includeIf "gitdir:/Users/irad/Developer/personal/"]
+	path = /Users/irad/.gitconfig-personal
