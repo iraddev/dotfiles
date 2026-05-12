@@ -69,9 +69,6 @@ alias gp="git pull"
 # ---------------------------------------------------------------------------
 export PATH="$HOME/.local/bin:$PATH"
 
-# OpenClaw Completion
-source "/Users/irad/.openclaw/completions/openclaw.zsh"
-
 # pnpm
 export PNPM_HOME="/Users/irad/Library/pnpm"
 case ":$PATH:" in
