@@ -55,7 +55,7 @@ alias sed="sd"
 alias diff="delta"
 alias lg="lazygit"
 alias top="btop"
-
+alias clauded="docker sandbox run claude"
 # ---------------------------------------------------------------------------
 # Git shortcuts
 # ---------------------------------------------------------------------------
@@ -68,3 +68,22 @@ alias gp="git pull"
 # Paths
 # ---------------------------------------------------------------------------
 export PATH="$HOME/.local/bin:$PATH"
+
+# OpenClaw Completion
+source "/Users/irad/.openclaw/completions/openclaw.zsh"
+
+# pnpm
+export PNPM_HOME="/Users/irad/Library/pnpm"
+case ":$PATH:" in
+  *":$PNPM_HOME:"*) ;;
+  *) export PATH="$PNPM_HOME:$PATH" ;;
+esac
+# pnpm end
+# The following lines have been added by Docker Desktop to enable Docker CLI completions.
+fpath=(/Users/irad/.docker/completions $fpath)
+autoload -Uz compinit
+compinit
+# End of Docker CLI completions
+
+# Added by LM Studio CLI tool (lms)
+export PATH="$PATH:/Users/irad/.lmstudio/bin"
