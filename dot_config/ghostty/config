@@ -1,0 +1,18 @@
+# Font
+font-family = FiraCode Nerd Font Mono
+font-size = 14
+
+# Theme
+theme = Catppuccin Mocha
+
+# Window
+window-padding-x = 10
+window-padding-y = 10
+window-decoration = true
+
+# Cursor
+cursor-style = bar
+cursor-style-blink = false
+
+# Shell — launch tmux on start (attach to existing session or create new)
+command = /bin/zsh -l -c "tmux new-session -A -s main"

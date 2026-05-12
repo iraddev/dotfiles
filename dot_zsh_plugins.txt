@@ -1,0 +1,11 @@
+# Completions (load before compinit)
+zsh-users/zsh-completions kind:fpath path:src
+belak/zsh-utils path:completion
+
+# Productivity
+zsh-users/zsh-autosuggestions
+zsh-users/zsh-history-substring-search
+Aloxaf/fzf-tab
+
+# Must be last
+zsh-users/zsh-syntax-highlighting

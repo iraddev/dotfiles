@@ -1,0 +1,70 @@
+# ---------------------------------------------------------------------------
+# Antidote (Plugin Manager)
+# ---------------------------------------------------------------------------
+source $(brew --prefix)/opt/antidote/share/antidote/antidote.zsh
+antidote load
+
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
+HISTFILE=~/.zsh_history
+HISTSIZE=10000
+SAVEHIST=10000
+setopt SHARE_HISTORY          # share across sessions
+setopt HIST_IGNORE_ALL_DUPS   # no duplicate entries
+setopt HIST_REDUCE_BLANKS     # trim whitespace
+setopt HIST_IGNORE_SPACE      # skip commands starting with space
+
+# ---------------------------------------------------------------------------
+# Key Bindings (history-substring-search)
+# ---------------------------------------------------------------------------
+bindkey '^[[A' history-substring-search-up
+bindkey '^[[B' history-substring-search-down
+
+# ---------------------------------------------------------------------------
+# FZF
+# ---------------------------------------------------------------------------
+source <(fzf --zsh)
+export FZF_DEFAULT_COMMAND='fd --type f --hidden --exclude .git'
+export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
+export FZF_ALT_C_COMMAND='fd --type d --hidden --exclude .git'
+export FZF_CTRL_T_OPTS="--preview 'bat --color=always --style=numbers --line-range=:500 {}'"
+export FZF_ALT_C_OPTS="--preview 'eza --tree --level=2 --icons {}'"
+
+# ---------------------------------------------------------------------------
+# Starship (Prompt)
+# ---------------------------------------------------------------------------
+eval "$(starship init zsh)"
+
+# ---------------------------------------------------------------------------
+# Zoxide (Navigation)
+# ---------------------------------------------------------------------------
+eval "$(zoxide init zsh)"
+
+# ---------------------------------------------------------------------------
+# Aliases — modern replacements
+# ---------------------------------------------------------------------------
+alias ls="eza --icons"
+alias ll="eza --icons -la --git"
+alias lt="eza --icons --tree --level=2"
+alias cat="bat --paging=never"
+alias less="bat"
+alias du="dust"
+alias ps="procs"
+alias sed="sd"
+alias diff="delta"
+alias lg="lazygit"
+alias top="btop"
+
+# ---------------------------------------------------------------------------
+# Git shortcuts
+# ---------------------------------------------------------------------------
+alias gs="git status"
+alias gd="git diff"
+alias gl="git log --oneline -20"
+alias gp="git pull"
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+export PATH="$HOME/.local/bin:$PATH"
