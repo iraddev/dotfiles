@@ -1,0 +1,11 @@
+[default]
+sso_session = Novee
+sso_account_id = 905020614044
+sso_role_name = novee-developer-access
+region = us-east-1
+output = json
+cli_pager = cat 
+[sso-session Novee]
+sso_start_url = https://novee.awsapps.com/start
+sso_region = us-east-1
+sso_registration_scopes = sso:account:access
