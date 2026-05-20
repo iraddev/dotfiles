@@ -1,11 +1,28 @@
+[sso-session novee]
+sso_start_url = https://novee.awsapps.com/start
+sso_region = us-east-1
+sso_registration_scopes = sso:account:access
 [default]
-sso_session = Novee
+sso_session = novee
 sso_account_id = 905020614044
 sso_role_name = novee-developer-access
 region = us-east-1
 output = json
 cli_pager = cat 
-[sso-session Novee]
-sso_start_url = https://novee.awsapps.com/start
-sso_region = us-east-1
-sso_registration_scopes = sso:account:access
+[profile dev]
+sso_session = novee
+sso_account_id = 794248400465
+sso_role_name = novee-rnd-access-dev
+region = us-east-1
+output = json
+[profile infra]
+sso_session = novee
+sso_account_id = 208760706591
+sso_role_name = novee-rnd-access-infra
+region = us-east-1
+output = json
+[profile admin]
+sso_session = novee
+sso_account_id = 905020614044
+sso_role_name = AdministratorAccess
+region = us-east-1

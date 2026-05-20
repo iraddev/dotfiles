@@ -17,9 +17,6 @@
       "Bash(dd *)",
       "Bash(wget *|bash*)",
       "Bash(wget *| bash*)",
-      "Bash(git push --force*)",
-      "Bash(git push *--force*)",
-      "Bash(git reset --hard*)",
       "Edit(~/.bashrc)",
       "Edit(~/.zshrc)",
       "Edit(~/.ssh/**)",
@@ -64,7 +61,9 @@
     "code-review@claude-plugins-official": true,
     "ralph-loop@claude-plugins-official": true,
     "clangd-lsp@claude-plugins-official": true,
-    "figma@claude-plugins-official": true
+    "figma@claude-plugins-official": false,
+    "vercel@claude-plugins-official": true,
+    "linear@claude-plugins-official": true
   },
   "extraKnownMarketplaces": {
     "trailofbits": {
@@ -94,5 +93,6 @@
   },
   "alwaysThinkingEnabled": true,
   "skipDangerousModePermissionPrompt": true,
+  "theme": "auto",
   "remoteControlAtStartup": false
 }

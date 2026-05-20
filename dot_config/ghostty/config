@@ -13,7 +13,8 @@ font-thicken = true
 adjust-cell-height = 2
 
 # --- Theme and Colors ---
-theme = Catppuccin Mocha
+term = xterm-256color
+theme = dark:Catppuccin Frappe,light:Catppuccin Latte
 
 # --- Window and Appearance ---
 background-opacity = 0.9

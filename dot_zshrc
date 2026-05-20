@@ -1,4 +1,13 @@
 # ---------------------------------------------------------------------------
+# fpath (must be set before antidote load — belak/zsh-utils calls compinit)
+# ---------------------------------------------------------------------------
+fpath=(
+  $(brew --prefix)/share/zsh/site-functions
+  $HOME/.docker/completions
+  $fpath
+)
+
+# ---------------------------------------------------------------------------
 # Antidote (Plugin Manager)
 # ---------------------------------------------------------------------------
 source $(brew --prefix)/opt/antidote/share/antidote/antidote.zsh
@@ -25,6 +34,8 @@ bindkey '^[[B' history-substring-search-down
 # FZF
 # ---------------------------------------------------------------------------
 source <(fzf --zsh)
+# fzf --zsh rebinds TAB to fzf-completion; restore fzf-tab's binding
+bindkey '^I' fzf-tab-complete
 export FZF_DEFAULT_COMMAND='fd --type f --hidden --exclude .git'
 export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
 export FZF_ALT_C_COMMAND='fd --type d --hidden --exclude .git'
@@ -55,7 +66,11 @@ alias sed="sd"
 alias diff="delta"
 alias lg="lazygit"
 alias top="btop"
+alias vim="nvim"
 alias clauded="docker sandbox run claude"
+alias awsl="assume default"
+alias c="claude"
+alias cc="claude --worktree"
 # ---------------------------------------------------------------------------
 # Git shortcuts
 # ---------------------------------------------------------------------------
@@ -76,11 +91,27 @@ case ":$PATH:" in
   *) export PATH="$PNPM_HOME:$PATH" ;;
 esac
 # pnpm end
-# The following lines have been added by Docker Desktop to enable Docker CLI completions.
-fpath=(/Users/irad/.docker/completions $fpath)
-autoload -Uz compinit
-compinit
-# End of Docker CLI completions
-
 # Added by LM Studio CLI tool (lms)
 export PATH="$PATH:/Users/irad/.lmstudio/bin"
+
+# Github
+export GITHUB_TOKEN=$(gh auth token)
+
+# Resend CLI
+export PATH="$HOME/.resend/bin:$PATH"
+
+# AWS
+export AWS_PROFILE=default
+
+# ---------------------------------------------------------------------------
+# k9s — sync skin to macOS appearance (Catppuccin Latte / Frappe)
+# ---------------------------------------------------------------------------
+k9s() {
+  local cfg="$HOME/Library/Application Support/k9s/config.yaml"
+  local skin="catppuccin-latte"
+  if defaults read -g AppleInterfaceStyle 2>/dev/null | grep -q Dark; then
+    skin="catppuccin-frappe"
+  fi
+  [[ -f $cfg ]] && /usr/bin/sed -i '' -E "s/^([[:space:]]*skin:).*/\1 ${skin}/" "$cfg"
+  command k9s "$@"
+}
